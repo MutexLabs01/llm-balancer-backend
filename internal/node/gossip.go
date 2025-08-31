@@ -32,7 +32,7 @@ type GossipManager struct {
 	address      string
 	peers        map[string]*GossipNode
 	mu           sync.RWMutex
-	queue        *queue.TaskQueue
+	queue        interface{} // Can be *queue.TaskQueue or *queue.WorkStealingQueue
 	httpClient   *http.Client
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -47,10 +47,11 @@ type GossipManager struct {
 	peerLatencyHistory map[string][]time.Duration
 	loadBalancingStrategy string
 	healthCheckInterval time.Duration
+	useWorkStealing     bool
 }
 
 // NewGossipManager creates a new gossip manager
-func NewGossipManager(nodeID, address string, queue *queue.TaskQueue) *GossipManager {
+func NewGossipManager(nodeID, address string, queue interface{}, useWorkStealing bool) *GossipManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	
 	return &GossipManager{
@@ -68,6 +69,7 @@ func NewGossipManager(nodeID, address string, queue *queue.TaskQueue) *GossipMan
 		peerLatencyHistory: make(map[string][]time.Duration),
 		loadBalancingStrategy: "weighted",
 		healthCheckInterval: 5 * time.Second,
+		useWorkStealing: useWorkStealing,
 	}
 }
 
@@ -78,6 +80,11 @@ func (gm *GossipManager) Start() {
 	go gm.taskRedistributionLoop()
 	go gm.healthCheckLoop()
 	go gm.latencyMonitoringLoop()
+	
+	// Start work stealing coordinator if enabled
+	if gm.useWorkStealing {
+		go gm.workStealingLoop()
+	}
 }
 
 // Stop stops the gossip protocol
@@ -454,6 +461,27 @@ func (gm *GossipManager) fetchTasksFromNode(address string) ([]*models.Task, err
 	return tasks, nil
 }
 
+// stealWorkFromNode attempts to steal work from another node when this node is underutilized
+func (gm *GossipManager) stealWorkFromNode(address string) (*models.Task, error) {
+	url := fmt.Sprintf("http://%s/api/v1/tasks/steal", address)
+	resp, err := gm.httpClient.Post(url, "application/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to steal work from node: status %d", resp.StatusCode)
+	}
+	
+	var task models.Task
+	if err := json.NewDecoder(resp.Body).Decode(&task); err != nil {
+		return nil, err
+	}
+	
+	return &task, nil
+}
+
 // getAvailablePeers returns peers that are alive and can accept tasks
 func (gm *GossipManager) getAvailablePeers() []*GossipNode {
 	gm.mu.RLock()
@@ -639,6 +667,87 @@ func (gm *GossipManager) latencyMonitoringLoop() {
 			gm.updatePeerLatencies()
 		}
 	}
+}
+
+// workStealingLoop periodically attempts to steal work from other nodes when underutilized
+func (gm *GossipManager) workStealingLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-gm.ctx.Done():
+			return
+		case <-ticker.C:
+			gm.attemptWorkStealing()
+		}
+	}
+}
+
+// attemptWorkStealing checks if this node is underutilized and attempts to steal work
+func (gm *GossipManager) attemptWorkStealing() {
+	// Check if this node is underutilized (less than 30% queue utilization)
+	var queueSize int
+	
+	// Get queue metrics based on queue type
+	if gm.useWorkStealing {
+		if wsQueue, ok := gm.queue.(*queue.WorkStealingQueue); ok {
+			queueSize = wsQueue.Size()
+		}
+	} else {
+		if regQueue, ok := gm.queue.(*queue.TaskQueue); ok {
+			queueSize = regQueue.Size()
+		}
+	}
+	
+	// Skip if we can't get queue info or if queue is not underutilized
+	// Using a fixed capacity for now - in a real implementation, this should come from config
+	fixedCapacity := 1000
+	if fixedCapacity == 0 || (float64(queueSize)/float64(fixedCapacity)) > 0.3 {
+		return
+	}
+	
+	// Find a peer with high load to steal from
+	peer := gm.findHighLoadPeer()
+	if peer == nil {
+		return
+	}
+	
+	// Attempt to steal work
+	task, err := gm.stealWorkFromNode(peer.Address)
+	if err != nil {
+		// Log but don't fail - this is normal when peers have no work
+		return
+	}
+	
+	// Add stolen task to our queue
+	if gm.useWorkStealing {
+		if wsQueue, ok := gm.queue.(*queue.WorkStealingQueue); ok {
+			wsQueue.Push(task)
+		}
+	} else {
+		if regQueue, ok := gm.queue.(*queue.TaskQueue); ok {
+			regQueue.Push(task)
+		}
+	}
+}
+
+// findHighLoadPeer finds a peer with high load that might have work to steal
+func (gm *GossipManager) findHighLoadPeer() *GossipNode {
+	gm.mu.RLock()
+	defer gm.mu.RUnlock()
+	
+	var bestPeer *GossipNode
+	var highestLoad float64
+	
+	for _, peer := range gm.peers {
+		if peer.Status == "alive" && peer.Load > highestLoad && peer.Load > 0.7 {
+			highestLoad = peer.Load
+			bestPeer = peer
+		}
+	}
+	
+	return bestPeer
 }
 
 // updatePeerLatencies updates latency information for all peers

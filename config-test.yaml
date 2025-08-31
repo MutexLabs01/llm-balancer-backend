@@ -19,4 +19,4 @@ node:
 
 logging:
   level: "info"
-  format: "text" 
+  format: "text"

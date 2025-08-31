@@ -36,4 +36,4 @@ logging:
 metrics:
   enabled: true
   port: 9090
-  path: "/metrics" 
+  path: "/metrics"
